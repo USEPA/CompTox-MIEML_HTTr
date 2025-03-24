@@ -46,7 +46,7 @@ Classifier training relies on several publicly available data sets:
 
 Currently, it is recommended to clone the entire repo to a user or analysis directory by running:
 ```bash
-git clone path.to.public.repo.git (/path/to/analysis)
+git clone https://github.com/USEPA/CompTox-MIEML_HTTr.git (/path/to/analysis)
 ```
 
 ## Running MIEML
