@@ -1,0 +1,464 @@
+---
+title: Summarize model performance of MIEML trained models
+author: "Joseph Bundy"
+date: "3/11/2025"
+output: 
+  html_notebook:
+    code_folding: none
+    toc: true
+    toc_depth: 1
+    toc_float: false
+    number_sections: false
+---
+
+This notebook is used to extract model summary information from MIEML result files
+
+
+## Data Import 
+
+<br>
+
+First import MIEML functions
+```{r}
+source("../scripts/ML_functions_HTTr.R")
+```
+
+use summarize_results_from_files to build a result summary dataframe for each model
+```{r}
+  results <- summarize_results_from_files(analysis_folder = "../data/model_files/analysis_3_8_2025")
+```
+## Explore Model Performance
+
+Create simple plot of internal accuracy as a function of training algorithm
+```{r, fig.width= 10, fig.height= 4}
+library(ggplot2)
+ggplot(data = results, aes(x=as.factor(model_name), y=internal_accuracy)) + 
+      #geom_boxplot() +
+  geom_jitter(width = 0.1) +
+      xlab("Training Algorithm") +
+  ylab("Internal Accuracy") +
+      theme(legend.position="none") 
+```
+Create a "passed_EST" column to annotate models as either passing or failing empirical significance testing based on internal and holdout accuracies
+```{r}
+results$passed_EST <- "no"
+results[results$int_acc_emp_pval <= 0.1 & results$hold_acc_emp_pval <= 0.1,]$passed_EST <- "yes"
+```
+
+how many classifiers passed empirical significance testing?
+```{r}
+nrow(results[results$passed_EST == "yes",])
+```
+
+what is the median internal accuracy of HPCs?
+```{r}
+median(results[results$passed_EST == "yes",]$internal_accuracy)
+```
+
+what is the median internal accuracy of HPCs?
+```{r}
+median(results[results$passed_EST == "yes",]$holdout_accuracy)
+```
+
+what molecular targets are represented among HPCs
+```{r}
+unique(results[results$passed_EST == "yes",]$target_name)
+```
+
+use the "make_annotations_pretty" function to reformat molecular target annotations to be more human readable
+```{r}
+results$pretty_MIE_name <- make_annotations_pretty(results$target_name)
+unique(results[results$passed_EST == "yes",]$pretty_MIE_name)
+```
+
+write classifier performance summary to disk
+```{r}
+write.csv(results, file = "../data/classifier_performance_summary.csv")
+```
+
+what MIEs had the highest and lowest internal accuracies on average?
+```{r}
+library(data.table)
+temp_by_MIE_performance <- data.table(results)
+temp_by_MIE_performance <-  temp_by_MIE_performance[,.(by_MIE_mean=mean(internal_accuracy),
+                                                  by_MIE_sd=sd(internal_accuracy)),by=pretty_MIE_name]
+temp_by_MIE_performance
+```
+
+what algorithm had the highest and lowest internal accuracies on average?
+```{r}
+library(data.table)
+temp_by_MIE_performance <- data.table(results)
+temp_by_MIE_performance <-  temp_by_MIE_performance[,.(by_algorithm_mean=mean(internal_accuracy),
+                                                  by_algorithm_sd=sd(internal_accuracy)),by=model_name]
+temp_by_MIE_performance
+```
+
+Define useful functions for plotting
+```{r}
+`%notin%` <- Negate(`%in%`)
+
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+```
+
+
+Generate barplot showing % of null classifiers out competed by standard classifier
+```{r, fig.width=10, fig.height=7}
+library(ggrepel)
+fills = c("AHR Agonism" = gg_color_hue(3)[1],
+          "ESR1 Agonism" = gg_color_hue(3)[2],
+          "NR3C1 Agonism" = gg_color_hue(3)[3],
+          "Other" = "black")
+
+temp_results <- results
+temp_results$prop_null_outcompeted <- 1 - temp_results$int_acc_emp_pval
+
+temp_table <- data.table(temp_results)
+temp_table <- temp_table[,.(mean=mean(prop_null_outcompeted)),by=pretty_MIE_name]
+temp_table <- temp_table[order(temp_table$mean, decreasing = TRUE),]
+
+temp_results$pretty_MIE_name <- factor(temp_results$pretty_MIE_name, levels = temp_table$pretty_MIE_name)
+
+temp_results$compound_name <- paste0(temp_results$pretty_MIE_name, " ", temp_results$model_name)
+
+temp_results <- temp_results[order(sapply(temp_results$pretty_MIE_name, function(x) which(x == temp_table$pretty_MIE_name))), ]
+
+temp_results$compound_name <- factor(temp_results$compound_name, levels = temp_results$compound_name)
+
+ggplot(data = temp_results, aes(y= prop_null_outcompeted, x = compound_name, fill = pretty_MIE_name)) + 
+      geom_bar(stat = "identity") +
+  ylab("Proportion of Null Models Outcompeted") +
+  scale_fill_manual(values = fills) +
+      theme(axis.title.x = element_blank(),
+            axis.text.x = element_text(angle = -90, vjust = .5, hjust=-.0)) +
+     guides(color = guide_legend(title="MIE Name", ncol = 2),
+            fill=guide_legend(title="MIE Name")) +
+  theme(legend.position = "bottom",
+        legend.box = "vertical")
+```
+
+floor signifiance results to 0.001 for plotting
+```{r}
+results[results$int_acc_emp_pval <= 0.001,]$int_acc_emp_pval <- 0.001
+results[results$hold_acc_emp_pval <= 0.001,]$hold_acc_emp_pval <- 0.001
+```
+
+initialize a list object for storing plots for multi-pane plots
+```{r}
+plot_list <- list()
+```
+
+
+Plot internal accuracy as a function of molecular target
+```{r, fig.width= 10, fig.height= 5}
+order <- data.table(results)
+order <-  order[,.(mean=mean(internal_accuracy)),by=pretty_MIE_name]
+order <- data.frame(order)
+order <- order[order(order$mean, decreasing = TRUE),]$pretty_MIE_name
+
+results$MIE <- results$pretty_MIE_name
+results[results$pretty_MIE_name %notin% c("AHR Agonism", "ESR1 Agonism", "NR3C1 Agonism"),]$MIE <- "Other"
+
+results$pretty_MIE_name <- factor(results$pretty_MIE_name, levels = order)
+
+
+fills = c("yes" = "red",
+          "no" = "black")
+
+plot_list[["internal_accuracy_dotplot"]] <- ggplot(data = results, aes(x=as.factor(pretty_MIE_name), 
+                                                                       y=internal_accuracy, 
+                                                                       pch = model_name,
+                                                                       color = passed_EST)) + 
+      geom_jitter(size = 3, width = 0.2) +
+  ylim(c(0,1)) +
+  ylab("Internal Accuracy") +
+  scale_color_manual(values = fills) +
+  theme_minimal() +
+      theme(axis.title.x = element_blank(),
+            axis.text.x = element_blank(),
+            legend.position = "none") 
+
+plot_list[["internal_accuracy_dotplot"]]
+```
+
+
+Generate a similar plot but with holdout accuracies
+```{r, fig.width= 10, fig.height= 5}
+plot_list[["holdout_accuracy_dotplot"]] <- ggplot(data = results, aes(x=as.factor(pretty_MIE_name), y=holdout_accuracy, pch = model_name, color = passed_EST)) + 
+      geom_jitter(size = 3, width = 0.2) +
+      xlab("MIE Name") +
+    ylim(c(0,1)) +
+    scale_color_manual(values = fills, name = "Passed E.S.T.") +
+  ylab("Holdout Accuracy") +
+    theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1),
+            legend.position = "bottom",
+            legend.box = "vertical") +
+  guides(shape=guide_legend(title="Training Algorithm"))
+
+plot_list[["holdout_accuracy_dotplot"]]
+```
+
+How does internal accuracy vary as a function of training profile number?
+```{r, fig.width= 7, fig.height= 5}
+plot_list[["internal_accuracy_by_training_profiles_dotplot"]] <- ggplot(data = results, aes(x=target_members, y=holdout_accuracy, pch = model_name)) + 
+      geom_jitter(size = 3, width = 0.1) +
+      xlab("#Gene expression profiles used in training") +
+    ylim(c(0,1)) +
+  ylab("Holdout Accuracy") +
+    theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1),
+            legend.position = "none")
+
+plot_list[["internal_accuracy_by_training_profiles_dotplot"]]
+```
+
+
+Generate a scatter plot of empirical and holdout accuracy empirical significance
+```{r, fig.width=6, fig.height=8}
+
+fills = c("AHR Agonism" = gg_color_hue(3)[1],
+          "ESR1 Agonism" = gg_color_hue(3)[2],
+          "NR3C1 Agonism" = gg_color_hue(3)[3],
+          "Other" = "black")
+
+plot_list[["emp_pvalue_regression"]] <- ggplot(data = results, aes(x= int_acc_emp_pval, y= hold_acc_emp_pval, pch = model_name, color = MIE)) + 
+      geom_point(size = 3) +
+  geom_text_repel(data = results[results$int_acc_emp_pval <= 0.1 & results$hold_acc_emp_pval <= 0.1,],
+                  aes(x= int_acc_emp_pval, 
+                      y= hold_acc_emp_pval, 
+                      label = make_annotations_pretty(target_name)), 
+                  size = 2.5) +
+      xlab("Internal Accuracy Emp P-val") +
+  ylab("Holdout Accuracy Emp P-val") +
+  scale_color_manual(values = fills) +
+  scale_y_continuous(trans='log10', limits = c(0.0005, 1.05)) +
+  scale_x_continuous(trans='log10', limits = c(0.0005, 1.05)) +
+  # xlim(-0.05, 1.05) +
+  # ylim(-0.05, 1.05) +
+  geom_vline(xintercept = 0.1, linetype = 2, color = "black", linewidth = 2) +
+  geom_hline(yintercept = 0.1, linetype = 2, color = "black", linewidth = 2) +
+      #theme(axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1)) +
+     guides(color = guide_legend(title="MIE Name", ncol = 2),
+            pch=guide_legend(title="Training Algorithm")) +
+    theme_minimal() +
+  theme(legend.position = "bottom",
+        legend.box = "vertical")
+
+plot_list[["emp_pvalue_regression"]]
+```
+
+```{r}
+tiff(filename = "../figures/emp_pvalue_regression.tiff", height = 8, width = 6, units = "in", res = 300)
+print(
+plot_list[["emp_pvalue_regression"]]
+  )
+dev.off()
+```
+
+
+
+
+Generate histogram showing volume of available training data
+```{r}
+collapsed_targets <- collapse_refchemdb_targets(refchemdb_path = "../data/refchemdb/NIHMS1537541-supplement-Supplement1.xlsx",
+                                                support_levels = c(3),
+                                                min_chemicals = 5,
+                                                cutree_h = 0.7,
+                                                cluster_method= "complete")
+
+target_annotations <- collapsed_targets$collapsed_targets
+target_annotations <- target_annotations[target_annotations$support >= 3,]
+
+stingy_target_annotations <- data.frame()
+for (i in unique(target_annotations$dsstox_substance_id)){
+  relevant_targets <- target_annotations[target_annotations$dsstox_substance_id == i,]
+  if(nrow(relevant_targets) > 0){
+    relevant_targets <- relevant_targets[order(relevant_targets$support, decreasing = TRUE),]
+    stingy_target_annotations <- rbind(head(relevant_targets, 1), stingy_target_annotations)
+  }
+}
+target_annotations <- stingy_target_annotations
+rm(stingy_target_annotations)
+
+
+message("- tabulating preprocessed targets -\n")
+target_table <- table_targets(target_annotations)
+
+message("- importing HTTr metadata -\n")
+metadata <- readRDS("../data/mongodb_dump/httr_metadata.rds")
+metadata <- metadata[metadata$dtxsid %in% target_annotations$dsstox_substance_id,]
+
+message("- Selecting Bioactive HTTr metadata -\n")
+tpod_estimates <- read.csv("../data/tpod_estimates/tpod_estimates.csv", header = TRUE)
+metadata <- merge(metadata, tpod_estimates[c("chem_id", "gene_bpac05")], by = "chem_id")
+metadata <- metadata[metadata$conc > metadata$gene_bpac05,]
+
+message("- importing relevant HTTr expression data -\n")
+nested_data <- get_gene_expression_data( metadata = metadata,
+                                         gene_expression_data_path = "../data/gene_expression/normalized_gene_expression_data.rds", 
+                                         seed = 123,
+                                         profile_limit = 20)
+
+message("- tabulating available HTTr profiles -\n")
+profile_table <- table_profiles(target_table = target_table, 
+                                metadata = nested_data$metadata, 
+                                target_annotations = target_annotations,
+                                min_chemicals = 5,
+                                min_profiles = 25)
+
+message("- identifying top reference chemicals for tabulated targets -\n")
+exemplar_chems <- get_exemplar_chems(target_annotations = target_annotations,
+                                     metadata = nested_data$metadata,
+                                     profile_table = profile_table,
+                                     min_chemicals = 5,
+                                     min_profiles = 25,
+                                     target_table = target_table)
+
+#save exemplar chemicals to disk to be used in the subsequent notebook
+write.csv(exemplar_chems, file = "../data/exemplar_chems.csv")
+
+message("- re-tabulating HTTr profiles excluding exemplar reference chemicals -\n")
+profile_table <- table_profiles(target_table = target_table, 
+                                metadata = nested_data$metadata, 
+                                target_annotations = target_annotations,
+                                min_chemicals = 5,
+                                min_profiles = 25,
+                                exemplar_chems = exemplar_chems)
+    
+
+temp <- profile_table
+
+#make MIE names more readable
+temp$target_mode <- make_annotations_pretty(temp$target_mode)
+
+temp <- temp[order(temp$n_chemicals, decreasing = FALSE),]
+temp$target_mode <- factor(temp$target_mode, levels = temp$target_mode)
+
+names(temp) <- c("MIE Name", "# Profiles", "# Chemicals")
+
+left_plot <- ggplot(temp, aes(x = `MIE Name`,y =  `# Chemicals`)) +
+  geom_bar(stat = "identity") +
+    theme_minimal() +
+  coord_flip()
+
+right_plot <- ggplot(temp, aes(x = `MIE Name`,y =  `# Profiles`)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+    theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y =  element_blank(),
+        axis.title.y = element_blank())
+
+library(cowplot)
+plot_list[["training_data_volume"]] <- plot_grid(left_plot,
+          right_plot,
+          ncol = 2,
+          nrow = 1,
+          rel_widths = c(1.5,1),
+          align = "h",
+          axis = "tblr")
+    
+plot_list[["training_data_volume"]]
+```
+
+
+
+Generate combined figure with training data volume and model performance
+```{r, fig.width=12, fig.height=8}
+left_plot <-  plot_grid(plot_list[["internal_accuracy_dotplot"]],
+                        plot_list[["holdout_accuracy_dotplot"]],
+                        ncol = 1,
+                        nrow = 2,
+                        labels = c("B", "C"),
+                        rel_heights = c(1,2)
+)
+
+plots <- plot_grid(
+  plot_list[["training_data_volume"]],
+  NULL,
+  left_plot,
+  labels = c("A", "", ""),
+          ncol = 3,
+          nrow = 1,
+          rel_widths = c(1,0.05,1)
+)
+  
+print(
+  plot_grid( plots, ncol=1, rel_heights=c(0.1, 1))
+  )
+
+```
+
+Save figure to disk
+```{r}
+tiff(filename = "../figures/classifier_performance.tiff", height = 8, width = 12, units = "in", res = 300)
+print(
+  plot_grid(plots, ncol=1, rel_heights=c(0.1, 1))
+  )
+dev.off()
+```
+
+
+Generate more compact plot of classifier performance and available training data
+```{r fig.height=3.5, fig.width=7}
+
+temp$`MIE Name` <- factor(temp$`MIE Name`, levels = levels(results$pretty_MIE_name))
+
+top_plot <- ggplot(temp, aes(x = `MIE Name`,y =  `# Chemicals`)) +
+  geom_bar(stat = "identity") +
+ theme(axis.text.x = element_blank(),
+       axis.title.x = element_blank())
+  
+fills = c("yes" = "red",
+          "no" = "black")
+
+bottom_plot <- ggplot(data = results, aes(x=as.factor(pretty_MIE_name), 
+                                          y=internal_accuracy, 
+                                          pch = model_name,
+                                          color = passed_EST)) + 
+  geom_jitter(size = 3, width = 0.2) +
+  ylim(c(0.5,1)) +
+  ylab("Internal Accuracy") +
+  scale_color_manual(values = fills, name = "Emp. Sig. Test") +
+  theme_minimal() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1),
+        legend.position = "right",
+        legend.box = "vertical")
+
+
+plot_grid(top_plot,
+                        bottom_plot,
+                        ncol = 1,
+                        nrow = 2,
+                        labels = c("", ""),
+                        rel_heights = c(1,2.5),
+                        align = "v",
+                        axis = "lr")
+```
+
+Save figure to disk
+```{r}
+tiff(filename = "../figures/classifier_performance_compact.tiff", height = 3.5, width = 7, units = "in", res = 300)
+print(
+plot_grid(top_plot,
+                        bottom_plot,
+                        ncol = 1,
+                        nrow = 2,
+                        labels = c("", ""),
+                        rel_heights = c(1,2.5),
+                        align = "v",
+                        axis = "lr")
+  )
+dev.off()
+```
+
+Print session info
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,405 @@
+---
+title: Explore Overlap between Test Chemicals Screened with HTTr and RefChemDB Annotations
+author: "Joseph Bundy"
+date: "3/14/2025"
+output: 
+  html_notebook:
+    code_folding: none
+    toc: true
+    toc_depth: 1
+    toc_float: false
+    number_sections: false
+---
+
+## Background
+
+There are over 1.7k chemicals screened in the large MCF-7 HTTr screen, but many of these are not associated with a known molecular target.  This notebook explores the overlap in chemical target annotations in RefChemDB in the context of what chemicals were included in the HTTr screen.
+
+<br>
+
+## Data Analysis
+
+Import raw refchemdb file and survey the number of chemicals and targets contained therein
+```{r}
+require(readxl)
+target_annotations <- data.frame(read_excel("../data/refchemdb/NIHMS1537541-supplement-Supplement1.xlsx", 
+                                            sheet = "S12 Data"))
+
+message("RefChemDB contains ", nrow(target_annotations), " entries spanning ", length(unique(target_annotations$dsstox_substance_id)), " chemicals and ", length(unique(target_annotations$target)), " targets")
+```
+
+
+Import MIEML functions and pre-process RefChemDB annotations
+```{r}
+#load mieml_httrpl functions
+source("../scripts/ML_functions_HTTr.R")
+
+collapsed_refchemdb_targets <- collapse_refchemdb_targets(refchemdb_path = "../data/refchemdb/NIHMS1537541-supplement-Supplement1.xlsx",
+                                                          support_levels = c(3),
+                                                          min_chemicals = 5,
+                                                          cutree_h = 0.7,
+                                                          cluster_method= "complete")
+```
+
+<br>
+
+Pull out the refchem_collapsed object as processed refchemdb annotations to be used in downstream functions.  
+```{r}
+refchem_collapsed <- collapsed_refchemdb_targets$collapsed_targets
+refchem_collapsed <- refchem_collapsed[refchem_collapsed$support >= 3,]
+```
+
+<br>
+
+Ensure that each chemical is matched to only one target in RefChemDB
+```{r}
+    stingy_target_annotations <- data.frame()
+    for (i in unique(refchem_collapsed$dsstox_substance_id)){
+      relevant_targets <- refchem_collapsed[refchem_collapsed$dsstox_substance_id == i,]
+      if(nrow(relevant_targets) > 0){
+        relevant_targets <- relevant_targets[order(relevant_targets$support, decreasing = TRUE),]
+        stingy_target_annotations <- rbind(head(relevant_targets, 1), stingy_target_annotations)
+      }
+    }
+    refchem_collapsed <- stingy_target_annotations
+    rm(stingy_target_annotations)
+```
+
+<br>
+
+Tabulate the number of chemicals available for each target_mode with table_targets()
+```{r, message = FALSE, warning = FALSE}
+target_table <- table_targets(refchem_collapsed)
+head(target_table)
+```
+
+<br>
+
+filter target table down to only targets that are associated with at least 5 chemical treatments
+```{r}
+target_table_filtered <- target_table[target_table$members >= 5,]
+```
+
+<br>
+
+import well information for mcf7 screen
+```{r}
+metadata <- readRDS("../data/mongodb_dump/httr_metadata.rds")
+
+#remove data from DMSO wells as well as water samples
+metadata <- metadata[metadata$stype == "test sample",]
+metadata <- metadata[!grepl("Water", metadata$chem_name),]
+```
+
+<br>
+
+Inspect the HTTr metadata object
+```{r}
+head(metadata)
+```
+
+<br>
+
+How many chemicals and gene expression profiles are covered in this object?
+```{r}
+message(length(unique(metadata$dtxsid)), " unique chemical treatments")
+message(nrow(metadata), " profiles")
+```
+
+<br>
+
+Define function for manually controlling ggplot2 colors
+```{r}
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+```
+
+<br>
+
+Generate a histogram showing how many screened chemicals were linked to RefChemDB targets
+```{r}
+library(ggplot2)
+library(data.table)
+
+plot_list <- list()
+
+temp_target_table <- refchem_collapsed[refchem_collapsed$dsstox_substance_id %in% metadata$dtxsid,]
+temp_target_table <- unique(temp_target_table[,c("dsstox_substance_id", "support", "target_mode")])
+temp_target_table <- data.frame(table(temp_target_table$target_mode))
+temp_target_table <- data.table(temp_target_table)
+temp_target_table <- temp_target_table[,.(MIE_count=length(unique(Var1))),by=Freq]
+temp_target_table$fill <- "holder"
+temp_target_table[temp_target_table$Freq < 5,]$fill <- "insufficient data"
+temp_target_table[temp_target_table$Freq >= 5,]$fill <- "sufficient data"
+
+plot_list[["MIE_coverage_barplot"]] <- ggplot(temp_target_table, aes(x = Freq, y = MIE_count, fill = fill)) +
+geom_bar(stat = "identity") +
+scale_fill_manual(values = gg_color_hue(3)[c(1,2)]) +
+geom_vline(xintercept = 5, linetype = "dashed") +
+theme_minimal() +
+theme(legend.position = "none") +
+xlab("# Chemicals Available for MIE")
+
+plot_list[["MIE_coverage_barplot"]] 
+```
+
+<br>
+
+Not all gene expression profiles in this data set will be suitable for training data sets, as some of the profiles will correspond to concentrations where the chemical is not active. Identify the subset of profiles that are suitable for training.
+
+```{r}
+#import tPOD estimates
+tpod_estimates <- read.csv("../data/tpod_estimates/tpod_estimates.csv", header = TRUE)
+
+#merge tPOD estimates with metadata
+bioactive_training_data <- merge(metadata, tpod_estimates[c("chem_id", "gene_bpac05")], by = "chem_id")
+
+#retain only metadata where the treatment was a higher concentration than the tpod
+bioactive_training_data <- bioactive_training_data[bioactive_training_data$conc > bioactive_training_data$gene_bpac05,]
+
+#retain only the chemicals linked to RefChemDB targets
+bioactive_training_data <- bioactive_training_data[bioactive_training_data$dtxsid %in% refchem_collapsed$dsstox_substance_id,]
+```
+
+<br>
+
+After selecting the bioactive gene expression profiles, how many persist in training data?
+```{r}
+message(length(unique(bioactive_training_data$chem_id)), " unique chemical samples")
+message(length(unique(bioactive_training_data$dtxsid)), " unique chemicals")
+message(nrow(bioactive_training_data), " profiles")
+```
+
+<br>
+
+Import and preprocess httrpl processed gene expression profiles
+
+profile_size is an upper limit to the number of gene expression profiles that can be included in training data for any one chemical.  If a chemical has more than profile_limit profiles, profiles will be dropped randomly so that there are profile_limit profiles per chemical.
+
+```{r, message = FALSE}
+nested_data <- get_gene_expression_data(metadata = bioactive_training_data,
+                                 seed = 123,
+                                 gene_expression_data_path = "../data/gene_expression/normalized_gene_expression_data.rds",
+                                profile_limit = 20)
+```
+
+<br>
+
+Tabulate gene expression profiles available for training MIE-specific models
+
+Tabulate the number of available HTTr profiles for each target_mode, specifying minimum cutoffs for the number of chemicals and/or profiles required for the target_mode to be a viable target for prediction
+
+```{r, message = FALSE}
+profile_table <- table_profiles(target_table = target_table, 
+                                 metadata =  nested_data$metadata, 
+                                 target_annotations = refchem_collapsed,
+                                 exemplar_chems = NULL,
+                                 min_profiles = 25, 
+                                 min_chemicals = 5)
+profile_table
+```
+
+<br>
+
+step through each chemical and assign a status based on presence in RefChemDB and whether there's sufficient data to use that chem to train models
+```{r}
+httr_chem <- unique(metadata[c("chem_name","dtxsid")])
+
+`%notin%` <- Negate(`%in%`)
+httr_chem$use <- "holder"
+
+for(temp_dtxsid in unique(httr_chem$dtxsid)){
+  if (temp_dtxsid %in% refchem_collapsed$dsstox_substance_id){
+  temp_target <- refchem_collapsed[refchem_collapsed$dsstox_substance_id == temp_dtxsid, "target_mode"]
+  if (temp_target %in% profile_table$target_mode){
+    httr_chem[httr_chem$dtxsid == temp_dtxsid,]$use <- "Linked to target"
+  }
+  if (temp_target %notin% profile_table$target_mode){
+    httr_chem[httr_chem$dtxsid == temp_dtxsid,]$use <- "Linked to a target, insufficient data"
+  }
+  }
+  if (temp_dtxsid %notin% refchem_collapsed$dsstox_substance_id){
+    httr_chem[httr_chem$dtxsid == temp_dtxsid,]$use <- "Not linked to a target"
+  }
+}
+```
+
+```{r}
+temp_httr_chem <- unique(httr_chem[c("dtxsid", "use")])
+data.frame(table(httr_chem$use))
+```
+
+<br>
+
+Note, two chemicals are linked to targets that have sufficient data for modeling, but are absent in the metadata object that is used to construct training data sets.  That is because these two chemicals have no concentration responsive genes, and so they are not actually used in classifier training. 
+```{r}
+setdiff(temp_httr_chem[temp_httr_chem$use == "Linked to target",]$dtxsid, nested_data$metadata$dtxsid)
+```
+
+<br>
+
+how many MIEs are represented in this data set that are not modeled due to insufficient data?
+```{r}
+length(unique(refchem_collapsed[refchem_collapsed$dsstox_substance_id %in% temp_httr_chem[temp_httr_chem$use == "Linked to a target, insufficient data",]$dtxsid,]$target_mode))
+```
+
+<br>
+
+Generate pie graph showing proportion of chemicals linked to RefChemDB targets vs not
+```{r, fig.width=6, fig.height=6}
+library(dplyr)
+library(plyr)
+
+
+# Create Data
+data <- data.frame(
+  group=c("Modeled with MIEML\n5.7% (99)", 
+          "Not linked to target\n86.2% (1508)",
+          "Insufficient data\n8.2% (143)\n\n"),
+  value=c(99, 1508, 143)
+)
+
+#data <- data.table(data)
+
+# Compute the position of labels
+data <- data %>% 
+  arrange(desc(group)) %>%
+  mutate(prop = value / sum(data$value) *100) %>%
+  mutate(ypos = cumsum(prop)- 0.5*prop )
+
+# Basic piechart
+plot_list[["chemical_coverage_piegraph"]] <- ggplot(data, aes(x="", y=prop, fill=group)) +
+#  ggtitle(label = paste0("HTTr and HTPP Bioactivity Concurrence for 1220 Test Chemicals")) +
+  geom_bar(stat="identity", width=1, color="white") +
+  coord_polar("y", start=0, direction = 1) +
+  theme_void() + 
+  theme(legend.position="none") +
+  
+  geom_text(aes(y = ypos, label = group), color = "white", size=3) +
+  #scale_fill_brewer(palette="Set2")
+  scale_fill_manual(values = gg_color_hue(3)[c(1,2,3)])
+
+plot_list[["chemical_coverage_piegraph"]] 
+```
+
+<br>
+
+Generate combination plot of histogram and pie graph
+
+```{r fig.width=8, fig.height=6}
+library(cowplot)
+plot_list[["combo_plot"]] <- plot_grid(plot_list[["MIE_coverage_barplot"]],
+                                                 plot_list[["chemical_coverage_piegraph"]],
+                                                 ncol = 2,
+                                                 nrow = 1,
+                                                 rel_widths = c(0.75,1.5),
+                                                 align = "h",
+                                                 axis = "tblr",
+                                       labels = c("A", "B"))
+plot_list[["combo_plot"]] 
+```
+
+<br>
+
+Save to disk
+
+```{r}
+tiff(filename = "../figures/refchemdb_coverage_combo.tiff", height = 6, width = 6, units = "in", res = 300)
+plot_list[["combo_plot"]] 
+dev.off()
+```
+
+<br>
+
+## Exemplar chemical identification
+
+Using the previously generated refchemdb objects and HTTr data, identify a set of "exemplar" chemicals that are annotated for viable targets with a high support level.  These chemicals and their profiles will be flagged for exclusion from training data in downstream analyses. 
+
+```{r}
+exemplar_chems <- get_exemplar_chems(target_annotations = refchem_collapsed,
+                                     metadata = nested_data$metadata,
+                                     target_table = target_table,
+                                     min_chemicals = 5,
+                                     min_profiles = 25,
+                                     profile_table = profile_table)
+
+exemplar_chems
+```
+
+<br>
+
+After identifying exemplar chemicals, we need to re-run the table_HTTr_profiles function to revise estimates of how many profiles are available for training each MIE
+```{r}
+profile_table <- table_profiles(target_table = target_table, 
+                                metadata =  nested_data$metadata, 
+                                target_annotations = refchem_collapsed,
+                                min_chemicals = 5,
+                                min_profiles = 25,
+                                exemplar_chems = exemplar_chems)
+profile_table
+```
+
+<br>
+
+generate a pretty graph showing this distribution
+```{r, fig.height=5, fig.width=8}
+library(cowplot)
+
+#make MIE names more readable
+temp <- profile_table
+
+temp$target_mode <- make_annotations_pretty(temp$target_mode)
+
+temp <- temp[order(temp$n_chemicals, decreasing = FALSE),]
+temp$target_mode <- factor(temp$target_mode, levels = temp$target_mode)
+
+names(temp) <- c("MIE Name", "#Profiles", "#Chems")
+
+left_plot <- ggplot(temp, aes(x = `MIE Name`,y =  `#Chems`)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  coord_flip()
+
+right_plot <- ggplot(temp, aes(x = `MIE Name`,y =  `#Profiles`)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y =  element_blank(),
+        axis.title.y = element_blank())
+
+plot_grid(left_plot,
+          right_plot,
+          ncol = 2,
+          nrow = 1,
+          rel_widths = c(1,1),
+          align = "h",
+          axis = "tblr")
+```
+
+<br>
+
+Save file to disk
+
+```{r}
+tiff(filename = "../figures/training_data_volume.tiff", height = 5, width = 8, units = "in", res = 300)
+plot_grid(left_plot,
+          right_plot,
+          ncol = 2,
+          nrow = 1,
+          rel_widths = c(1,1),
+          align = "h",
+          axis = "tblr")
+dev.off()
+```
+
+<br>
+
+Print session info
+
+```{r}
+sessionInfo()
+```
+

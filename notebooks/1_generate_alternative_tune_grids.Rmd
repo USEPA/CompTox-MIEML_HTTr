@@ -1,0 +1,110 @@
+---
+title: R Notebook for generating alternative tune grids for mieml
+output: 
+  html_notebook:
+    code_folding: none
+    toc: false
+    toc_depth: 1
+    toc_float: false
+    number_sections: false
+author: Joseph Bundy
+date: 3/5/2025
+---
+
+This notebook shows how to generate an R "list" object for use in the mieml classifier training workflow.  This (optional) list object is used within mieml functions to identify tuning grid options for machine learning algorithms where the user desires to override the default hyperparameter tuning options in [caret](https://topepo.github.io/caret/model-training-and-tuning.html#model-training-and-parameter-tuning). 
+
+## Create expanded tuning grid for "dnn" and "mlpML" methods
+
+```{r}
+starting_layer_sizes <- c(80,40,20)
+dnn <- data.frame()
+for (i in 1:length(starting_layer_sizes)){
+  temp = data.frame("layer1" = starting_layer_sizes[i],
+                    "layer2" = starting_layer_sizes[i]*0.5,
+                    "layer3" = starting_layer_sizes[i]*0.25)
+  dnn <- rbind(temp, dnn)
+}
+
+mlpML <- dnn
+
+dnn <- cbind(dnn, data.frame("hidden_dropout" = c(rep(0.2, 3), rep(0.8,3))))
+dnn$visible_dropout <- 0
+```
+
+<br>
+
+## Create expanded tuning grid for "rf" method
+
+```{r}
+rf <- data.frame("mtry" = c(0.95, 0.9, 0.8))
+```
+
+<br>
+
+## Create expanded tuning grid for "knn" method
+
+```{r}
+knn <- data.frame("k" = c(3,5,7,9,11))
+```
+
+<br>
+
+## Create expanded tuning grid for "svmLinear" method
+
+```{r}
+svmLinear <- data.frame("C" = c(1, 10, 100))
+```
+
+<br>
+
+## Create expanded tuning grid for "svmRadial" method
+
+```{r}
+svmRadial <- expand.grid("C" = c(1, 10, 100), "sigma" = c(0.1, 0.01, 0.001, 0.0001))
+```
+
+<br>
+
+## Create expanded tuning grid for "svnLinear" method
+
+```{r}
+svmPoly <- expand.grid("C" = c(1, 10, 100), "degree" = c(1,2,3), "scale" = c(0.001, 0.01, 0.1))
+```
+
+<br>
+
+## Create expanded tuning grid for "keras_cnn" method
+
++ Note, this is not a `caret` method.  Rather, this refers to an implementation of a convolutional neural network based model using the [keras library](https://keras.io/) in python, called fom R using [reticulate](https://rstudio.github.io/reticulate/). 
+
+```{r}
+library(tidyr)
+keras_cnn = expand_grid("dropout_rates" = c(0.2,0.3), "first_layer_sizes" = c(100, 80, 60))
+```
+
+<br>
+
+## Combine expanded tuning grid objects into named list object
+
+```{r}
+expanded_grid <- list("dnn" = dnn, "knn" = knn, "svmLinear" = svmLinear, "svmRadial" =  svmRadial, "svmPoly" =  svmPoly, "mlpML" = mlpML, "rf" = rf, "keras_cnn" = keras_cnn)
+```
+
+<br>
+
+## Save named list object as .rds file
+
+```{r}
+if (!file.exists("../data/expanded_grid")){
+  dir.create("../data/expanded_grid")
+}
+saveRDS(expanded_grid, file = "../data/expanded_grid/expanded_grid.rds")
+```
+
+<br>
+
+Print session info
+```{r}
+sessionInfo()
+```
+

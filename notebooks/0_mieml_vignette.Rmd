@@ -1,0 +1,756 @@
+---
+title: Vignette for mieml (Molecular Initiating Events prediction with Machine Learning) Package
+author: "Joseph Bundy"
+date: "3/5/2025"
+output: 
+  html_notebook:
+    code_folding: none
+    toc: true
+    toc_depth: 1
+    toc_float: false
+    number_sections: false
+---
+
+<br>
+
+## Package Description
+
+This notebook contains examples instructing how to use functions in the mieml package. These functions were originally developed with the objective of prediction MIE activation from LINCS L1000 data from the CMAP consortium, as is described [here](https://biodatamining.biomedcentral.com/articles/10.1186/s13040-022-00292-z). Functions in the current package have been adapted to predict MIE activation from TempO-Seq based chemical screening data that is was processed using the httrpl package. 
+
+
+The mieml package is not on CRAN. It is an internal and custom-built package developed by researchers at U.S. EPA. It is dependent on several public R packages listed below, which need to be installed before attempting to use the package.
+
+
+Several low level functions within mieml pull data directly from mongoDB databases adhering to EPA's current httrpl schema for storing TempO-Seq results. These functions can also pull information from json files using httrpl schemas.
+
+***
+
+<br>
+
+## Package Dependencies
+
+CRAN supported packages
+
+* [rlist](https://CRAN.R-project.org/package=rlist)
+* [dplyr](https://CRAN.R-project.org/package=dplyr)
+* [plyr](https://CRAN.R-project.org/package=plyr)
+* [data.table](https://CRAN.R-project.org/package=data.table)
+* [caret](https://CRAN.R-project.org/package=caret)
+* [doParallel](https://CRAN.R-project.org/package=doParallel)
+* [foreach](https://CRAN.R-project.org/package=foreach)
+* [parallel](https://CRAN.R-project.org/package=parallel) 
+* [readxl](https://CRAN.R-project.org/package=readxl) 
+
+Independent packages
+
+* [httrpl](https://github.com/USEPA/CompTox-httrpl)
+
+
+***
+
+<br>
+
+## Prerequisite Steps to Pipeline
+
+Before training models with mieml, some data pre-processing is required.  These pre-processing steps are outlined in R markdown documents.
+
+<br>
+
+### Generating Alternative Tuning Grids
+
+By default, the [caret package](https://topepo.github.io/caret/) in R uses default tuning grids for hyperparameter tuning. Users may wish to override these defaults and instead use a custom set of training hyperparameters. See this [notebook](./1_generate_alternative_tune_grids.Rmd) for instructions on how to generate an expanded hyperparameter tuning grid object for mieml_httrpl.
+
+Import hyperparameter tuning grid object
+```{r}
+expanded_grid <-readRDS(file = "../data/expanded_grid/expanded_grid.rds")
+```
+
+This object is a named list.  Each element of the list is named for a method (machine learning algorithm) implemented in caret. 
+```{r}
+names(expanded_grid)
+```
+
+Each element of this list is a dataframe with as many columns as there are hyperparameters for the algorithm, and as many rows as there are unique combinations of hyperparameters.
+```{r}
+expanded_grid$dnn
+```
+
+
+<br>
+
+### Preprocessing databased httrpl processed gene expression data and saving to disk
+
+To train classifiers on gene expression processed using httrpl, some preprocessing steps are necessary.  Models are trained on log2CPM (counts per million) values after filtering out low abundance genes.  Instructions on how to prepossess httrpl data for input into mieml can be found [here](./2_preprocess_gene_exp_data.Rmd). 
+
+***
+
+## Data Import and Preprocessing
+
+<br>
+
+### Source ML functions from R scripts
+
++ note, these paths need to be redirected to source the local install of the MIEML_HTTrPL and httrpl packages
+```{r}
+options(stringsAsFactors = FALSE)
+
+#load mieml_httrpl functions
+source("../scripts/ML_functions_HTTr.R")
+```
+
+<br>
+
+### Import RefChemDB Chemical-MIE labels
+
+[RefChemDB](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6784312/) is a database of chemical-target relationships identified from literature mining approaches. The current mieml_httrpl pipeline imports and preprocesses these annotations to identify reference chemicals linked to MIEs of interest. 
+
+For convenience, this file is provided in the mieml repo
+
+Import supplementary info from RefChemDB publication, supplementary table 12
+```{r}
+library(readxl)
+refchemdb_raw <- read_excel("../data/refchemdb/NIHMS1537541-supplement-Supplement1.xlsx", sheet = "S12 Data")
+```
+
+<br>
+
+Inspect the first few rows to get a sense of how these data are structured
+```{r}
+head(refchemdb_raw)
+```
+
+<br>
+
+Entries in RefChemDB are associated with a specific "support level" - an integer indicating the number of literature sources that evidence a given relationship.  Generate a table showing the number of entries associated with each support levels of three or greater
+
+```{r}
+temp <- data.frame(table(refchemdb_raw[refchemdb_raw$support >= 3,]$support))
+head(temp[order(temp$Freq, decreasing = TRUE),],5)
+tail(temp[order(temp$Freq, decreasing = TRUE),],5)
+```
+
+Most entries have a relatively small support level (under 5).  These entries show significantly better agreement with toxcast assays than entries at a support level of 3 or 4 according to the original RefChemDB publication, which is why support level 5 recommended as a default filter. 
+
+<br>
+
+Some entries in RefChemDB are contradictory, with the same chemical linked to the same target with opposite modes. This is expected, as RefChemDB was a product generated via the automated curration of data from multiple sources:
+
+```{r}
+refchemdb_raw[refchemdb_raw$name == "17beta-Estradiol" & refchemdb_raw$target == "ESR1",]
+```
+
+<br>
+
+Some targets annotated in RefChemDB are similar with respect to the chemicals that are annotated:
+```{r}
+data.frame(
+"ESR1(+) specific" = length(setdiff(refchemdb_raw[refchemdb_raw$target == "ESR1" & refchemdb_raw$mode == "Positive" & refchemdb_raw$support >= 3,]$dsstox_substance_id, refchemdb_raw[refchemdb_raw$target == "ESR2" & refchemdb_raw$mode == "Positive" & refchemdb_raw$support >= 3,]$dsstox_substance_id)), 
+
+"ESR2(+) specific" = length(setdiff(refchemdb_raw[refchemdb_raw$target == "ESR2" & refchemdb_raw$mode == "Positive" & refchemdb_raw$support >= 3,]$dsstox_substance_id, refchemdb_raw[refchemdb_raw$target == "ESR1" & refchemdb_raw$mode == "Positive" & refchemdb_raw$support >= 3,]$dsstox_substance_id)), 
+
+"Both Targets" = length(intersect(refchemdb_raw[refchemdb_raw$target == "ESR1" & refchemdb_raw$mode == "Positive" & refchemdb_raw$support >= 3,]$dsstox_substance_id, refchemdb_raw[refchemdb_raw$target == "ESR2" & refchemdb_raw$mode == "Positive" & refchemdb_raw$support >= 3,]$dsstox_substance_id)))
+```
+
+<br>
+
+### Preprocess refchemDB by collapsing redundant targets into supertargets
+
+```{r}
+collapsed_refchemdb_targets <- collapse_refchemdb_targets(refchemdb_path = "../data/refchemdb/NIHMS1537541-supplement-Supplement1.xlsx",
+                                                        support_levels = c(3),
+                                                        min_chemicals = 5,
+                                                        cutree_h = 0.7,
+                                                        cluster_method= "complete")
+```
+
+<br>
+
+The resulting object has three components.  
+
+```{r}
+names(collapsed_refchemdb_targets)
+```
+
+<br>
+
+1. collapsed_targets is the processed RefChemDB database with highly similar targets collapsed into the same more broad target
+
+```{r}
+head(collapsed_refchemdb_targets$collapsed_targets)
+```
+
+<br>
+
+2. The jaccard matrix showing the maximum dissimilarity (this varies depending on support level filter) among the lists of chemicals associted with each target 
+```{r}
+head(collapsed_refchemdb_targets$jaccard_matrix)
+```
+
+<br>
+
+3. The grouping table showing which targets were grouped together based on similarity - useful later in the analysis when trying to match specific gene targets to these MIE labels:
+
+```{r}
+head(collapsed_refchemdb_targets$groups)
+```
+
+<br>
+
+Pull out the refchem_collapsed object as processed refchemdb annotations to be used in downstream functions.  Collapsed targets still need to be filtered by support level before proceeding
+```{r}
+refchem_collapsed <- collapsed_refchemdb_targets$collapsed_targets
+refchem_collapsed <- refchem_collapsed[refchem_collapsed$support >= 3,]
+```
+
+<br>
+
+
+
+```{r}
+    stingy_target_annotations <- data.frame()
+    for (i in unique(refchem_collapsed$dsstox_substance_id)){
+      relevant_targets <- refchem_collapsed[refchem_collapsed$dsstox_substance_id == i,]
+      if(nrow(relevant_targets) > 0){
+        relevant_targets <- relevant_targets[order(relevant_targets$support, decreasing = TRUE),]
+        stingy_target_annotations <- rbind(head(relevant_targets, 1), stingy_target_annotations)
+      }
+    }
+    refchem_collapsed <- stingy_target_annotations
+    rm(stingy_target_annotations)
+```
+
+<br>
+
+Save these processed RefChemDB annotations to disk
+```{r}
+write.csv(refchem_collapsed, file = "../data/refchemdb/processed_refchemdb_annotations.csv")
+```
+
+
+<br>
+
+### Tabulate MIE-specific reference chemicals
+
+Tabulate the number of chemicals available for each target_mode with table_targets()
+```{r, message = FALSE, warning = FALSE}
+target_table <- table_targets(refchem_collapsed)
+head(target_table)
+```
+
+
+<br>
+
+### Import and perprocess metadata from httrpl processed collection
+
+Import HTTr metadata for chemicals listed in the refchemDB file.  This function requires mongoDB access
+
+
+```{r}
+metadata_path = c("../data/mongodb_dump/httr_metadata.rds")
+metadata <- readRDS(metadata_path)
+metadata <- metadata[metadata$dtxsid %in% refchem_collapsed$dsstox_substance_id,]
+```
+
+<br>
+
+Inspect the HTTr metadata object
+```{r}
+head(metadata)
+```
+
+<br>
+
+How many chemicals and gene expression profiles are covered in this object?
+```{r}
+message(length(unique(metadata$dtxsid)), " unique chemical treatments")
+message(nrow(metadata), " profiles")
+```
+
+
+<br>
+
+Not all gene expression profiles in this data set will be suitable for training data sets, as some of the profiles will correspond to concentrations where the chemical is not active. Read in transcriptional points of departure estimates to identify a subset of profiles that are suitable.
+
+```{r}
+tpod_estimates <- read.csv("../data/tpod_estimates/tpod_estimates.csv", header = TRUE)
+bioactive_training_data <- merge(metadata, tpod_estimates[c("chem_id", "gene_bpac05")], by = "chem_id")
+bioactive_training_data <- bioactive_training_data[bioactive_training_data$conc > bioactive_training_data$gene_bpac05,]
+```
+
+<br>
+
+After selecting the bioactive gene expression profiles, how many persist in training data?
+```{r}
+message(length(unique(bioactive_training_data$dtxsid)), " unique chemical treatments")
+message(nrow(bioactive_training_data), " profiles")
+```
+
+<br>
+
+Generate target table containing only chemicals present in the screen
+```{r}
+library(ggplot2)
+
+temp_target_table <- refchem_collapsed[refchem_collapsed$dsstox_substance_id %in% metadata$dtxsid,]
+temp_target_table <- unique(temp_target_table[,c("dsstox_substance_id", "support", "target_mode")])
+temp_target_table <- data.frame(table(temp_target_table$target_mode))
+
+ggplot(temp_target_table, aes(x = Freq)) +
+geom_histogram(stat = "bin") +
+xlab("# Chemicals Available for MIE")
+```
+
+<br>
+
+### Import and preprocess gene expression profiles
+
+Use mieml_httrpl functions to import preprocessed gene expression data from disk.  Instructions for preprocessing gene expression data can be found [here](./preprocess_gene_exp_data.Rmd). 
+
+profile_size is an upper limit to the number of gene expression profiles that can be included in training data for any one chemical.  If a chemical has more than profile_limit profiles, profiles will be dropped randomly so that there are profile_limit profiles per chemical.
+
+```{r, message = FALSE}
+nested_data <- get_gene_expression_data(metadata = bioactive_training_data,
+                                 seed = 123,
+                                 gene_expression_data_path = "../data/gene_expression/normalized_gene_expression_data.rds",
+                                profile_limit = 20
+)
+```
+
+### Tabulate gene expression profiles available for training MIE-specific models
+
+<br>
+
+Tabulate the number of available profiles for each target_mode, specifying minimum cutoffs for the number of chemicals and/or profiles required for the target_mode to be a viable target for prediction
+
+```{r, message = FALSE}
+profile_table <- table_profiles(target_table = target_table, 
+                                 metadata =  nested_data$metadata, 
+                                 target_annotations = refchem_collapsed,
+                                 exemplar_chems = NULL,
+                                 min_profiles = 25, 
+                                 min_chemicals = 5)
+profile_table
+```
+
+<br>
+
+### Exemplar chemical identification
+
+Using the previously generated refchemdb objects and HTTr data, identify a set of "exemplar" chemicals that are annotated for viable targets with a high support level.  These chemicals and their profiles will be flagged for exclusion from training data in downstream analyses. 
+
+```{r}
+exemplar_chems <- get_exemplar_chems(target_annotations = refchem_collapsed,
+                                     metadata = nested_data$metadata,
+                                     target_table = target_table,
+                                     min_chemicals = 5,
+                                     min_profiles = 25,
+                                     profile_table = profile_table)
+
+head(exemplar_chems)  
+```
+
+<br>
+
+After identifying exemplar chemicals, we need to re-run the table_HTTr_profiles function to revise estimates of how many profiles are available for training each MIE
+```{r}
+profile_table <- table_profiles(target_table = target_table, 
+                                metadata =  nested_data$metadata, 
+                                target_annotations = refchem_collapsed,
+                                min_chemicals = 5,
+                                min_profiles = 25,
+                                exemplar_chems = exemplar_chems)
+profile_table
+```
+
+<br>
+
+generate a pretty graph showing this distribution
+```{r, fig.height=5, fig.width=8}
+library(ggplot2)
+library(cowplot)
+
+#make MIE names more readable
+
+temp <- profile_table
+temp$target_mode <- gsub(pattern = "_Positive_group", x = temp$target_mode, replacement = " Agonist")
+temp$target_mode <- gsub(pattern = "_Positive", x = temp$target_mode, replacement = " Agonist")
+temp$target_mode <- gsub(pattern = "_Negative_group", x = temp$target_mode, replacement = " Antagonist")
+temp$target_mode <- gsub(pattern = "_Negative", x = temp$target_mode, replacement = " Antagonist")
+
+temp <- temp[order(temp$n_chemicals, decreasing = FALSE),]
+temp$target_mode <- factor(temp$target_mode, levels = temp$target_mode)
+
+names(temp) <- c("MIE Name", "#Profiles", "#Chems")
+
+left_plot <- ggplot(temp, aes(x = `MIE Name`,y =  `#Chems`)) +
+  geom_bar(stat = "identity") +
+  coord_flip()
+
+right_plot <- ggplot(temp, aes(x = `MIE Name`,y =  `#Profiles`)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y =  element_blank(),
+        axis.title.y = element_blank())
+
+plot_grid(left_plot,
+          right_plot,
+          ncol = 2,
+          nrow = 1,
+          rel_widths = c(1,1),
+          align = "h",
+          axis = "tblr")
+```
+
+<br>
+
+#### Generate MIE specific training data sets
+
+Use the mieml_httrpl functions to generate a target-specific training data set for the first MIE in the profile table object.
+
+```{r}
+target_specific_training_data <- get_data_for_target(seed = 123,
+                                           target_name = profile_table$target_mode[1],
+                                           exemplar_chems = exemplar_chems,
+                                           nested_data = nested_data,
+                                           target_annotations = refchem_collapsed,
+                                           generate_null = FALSE)
+```
+
+<br>
+
+Confirm the proportions of data labels appear correct
+
+```{r}
+ data.frame(table(paste0(target_specific_training_data$metadata$label, "_", target_specific_training_data$metadata$use)))
+```
+
+
+<br>
+
+### Generating Null Training Data Sets
+
+To facilitate training null models, the generate_noise parameter can be set to TRUE for this function, which will return a dummy set of target-specific training chemicals.  
+
+```{r}
+null_target_specific_training_data <- get_data_for_target(seed = 123,
+                                           target_name = profile_table$target_mode[1],
+                                           exemplar_chems = exemplar_chems,
+                                           nested_data = nested_data,
+                                           target_annotations = refchem_collapsed,
+                                           generate_null = TRUE)
+```
+
+<br>
+
+Confirm the proportions of data labels appear correct
+
+```{r}
+ data.frame(table(paste0(null_target_specific_training_data$metadata$label, "_", null_target_specific_training_data$metadata$use)))
+```
+
+Training data for "null" classifiers have the same number of gene expression profiles as the original training data set.
+
+```{r}
+temp <- data.frame(table(target_specific_training_data$metadata[target_specific_training_data$metadata$label == "target",]$chem_id))
+
+temp[order(temp$Freq, decreasing = TRUE),]
+```
+
+```{r}
+temp <- data.frame(table(null_target_specific_training_data$metadata[null_target_specific_training_data$metadata$label == "target",]$chem_id))
+
+temp[order(temp$Freq, decreasing = TRUE),]
+```
+
+<br>
+
+***
+
+## Model Training Functions
+
+With preprocessing steps complete, training data are now formatted for use with mieml_httrpl functions to train classifiers. Start by training two classifiers for the first target in profile table using svmLinear and knn
+
+### Training Classifiers for a Single MIE
+
+
+```{r}
+target_name= "NR3C1_Positive" 
+model_names = c("svmLinear") 
+allowParallel_training = TRUE
+expanded_grid = expanded_grid
+generate_null = FALSE
+support_level = 3
+nested_data = nested_data
+target_annotations  = refchem_collapsed
+return_model = TRUE
+seed = 123
+exemplar_chems = exemplar_chems
+save_model = FALSE
+output_dir = NULL
+```
+
+
+```{r, message = FALSE}
+source("../scripts/ML_functions_HTTr.R")
+MIE_specific_model <- model_target(target_name= "NR3C1_Positive", 
+                               model_names = c("svmLinear", "knn"), 
+                              allowParallel_training = TRUE,
+                              expanded_grid = expanded_grid,
+                               generate_null = FALSE,
+                               support_level = 3,
+                              nested_data = nested_data,
+                               target_annotations  = refchem_collapsed,
+                               return_model = TRUE,
+                               seed = 123,
+                               exemplar_chems = exemplar_chems,
+                               save_model = FALSE)
+```
+
+<br>
+
+objects from model_target have two components: a result summary, and a model_object which primarily consists of the CARET output
+```{r}
+names(MIE_specific_model)
+```
+
+<br>
+
+The results summary contains model performance summary info in the form of a data.frame
+```{r}
+MIE_specific_model$results_summary
+```
+
+<br>
+
+The "model_objects" component of the object contains detailed information from the CARET model, broken down by algorithm name
+
+```{r}
+names(MIE_specific_model$model_objects)
+```
+
+```{r}
+names(MIE_specific_model$model_objects[[1]])
+```
+
+<br>
+
+The "pred" element is a dataframe that shows the predictions for the "target" portion of the holdout data, along with a number of predictions from random "null" profiles 
+```{r}
+head(MIE_specific_model$model_objects[[1]]$pred)
+```
+
+### Generating Null Classifiers
+
+For validation purposes, the current mieml_httrpl pipeline involves training multiple "null" classifiers for each MIE-algorithm combination. The performance of these null classifiers is used to gauge the value of annotations in the original classifier.  The permute_models function facilitates the generation of these null classifiers.  This is a wrapper around the model_target function, which generates multiple null models for each MIE and algorithm, increasing the input seed during each iteration so that the models are slightly different.
+
+```{r}
+permuted_results <- generate_null_models(target_name= profile_table$target_mode[nrow(profile_table)], 
+                                   allowParallel_training = FALSE,
+                                   null_workers = 8,
+                                   model_names = c("svmLinear", "knn"), 
+                                   seed = 123,
+                                   support_level = 3,
+                                   nested_data = nested_data,
+                                   target_annotations  = refchem_collapsed,
+                                   exemplar_chems = exemplar_chems,
+                                   n_nulls = 24)
+```
+
+<br>
+
+Output from this function is a "summary_output" data frame with model performance info for each null classifier, and an "metadata" component, which is a list of all the metadata collections used for each null classifier. 
+
+```{r}
+names(permuted_results)
+```
+
+```{r}
+head(permuted_results$summary_output)
+```
+
+<br>
+
+If desired, one can run a permutation test for a single MIE using "permutation_test".  This is a stand-alone function purposed for running single tests, and is not called internally by other functions in this pipeline.
+
+```{r}
+empirical_significance_summary <- empirical_significance_test(target_name= profile_table$target_mode[1], 
+                                                              expanded_grid = expanded_grid,
+                                                              null_workers = 6,
+                                                              model_names = c("svmLinear", "svmRadial"), 
+                                                              seed = 123,
+                                                              support_level = 3,
+                                                              nested_data = nested_data,
+                                                              target_annotations = refchem_collapsed,
+                                                              exemplar_chems = exemplar_chems,
+                                                              n_nulls = 6)
+```
+
+Result object has two components
+
+```{r}
+names(empirical_significance_summary)
+```
+
+<br> 
+
+The n_nulls summary component contains results for the empirical significance test
+
+```{r}
+empirical_significance_summary$permutation_summary
+```
+
+<br>
+
+### Training Multiple Target_modes
+
+Instead of training one model at a time, we can alternatively train models against all targets present in a profile_table. Generate a trimmed profile table containing only a few model_targets.
+```{r}
+trimmed_profile_table <- profile_table[profile_table$target_mode %in% c("NR3C1_Positive", "AHR_Positive"),]
+trimmed_profile_table
+```
+
+<br>
+
+Use model_targets to train classifiers for these two MIEs
+
+```{r, message = FALSE}
+model_targets_result <-  model_targets(profile_table = trimmed_profile_table, 
+                                 model_names = c("svmLinear", "svmRadial"),
+                                 expanded_grid = expanded_grid,
+                                 generate_null = FALSE,
+                                 target_workers = 2,
+                                 null_workers = 1,
+                                 add_nulls = TRUE,
+                                 n_nulls = 1,
+                                 support_level = 3,
+                                 nested_data = nested_data,
+                                 target_annotations = refchem_collapsed,
+                                 seed = 123, 
+                                 exemplar_chems = exemplar_chems)
+```
+
+The result is a list named for the MIE for which classifiers were trained
+
+```{r}
+names(model_targets_result)
+```
+
+<br>
+
+Within each list element are the results from a single run of model_target 
+
+```{r}
+names(model_targets_result[[1]])
+```
+
+<br>
+
+Iterate through each list element and plot classifier prediction results
+
+```{r}
+for (i in 1:length(model_targets_result)){
+  temp = model_targets_result[[i]][[2]][[1]]$pred
+  
+  temp = temp[temp$label != "exemplar",]
+
+mu <- ddply(temp, "label", summarise, grp.mean=mean(target))
+
+print(ggplot(data = temp, aes(x = target, fill = label))+
+  ggtitle(names(model_targets_result)[i])+
+  geom_area(stat = "bin", alpha = 0.6, binwidth = 0.1)+
+  xlim(0,1)+
+  theme_classic()+
+  xlab(label = "prediction")+
+  geom_vline(data = mu, aes(xintercept = grp.mean, color = label),linetype = "dashed"))
+}
+```
+
+<br>
+
+As was the case with model_target, model_targets accepts a "generate_noise" argument, which will result in generation of null models.
+```{r, message = FALSE}
+model_targets_result_null <-  model_targets(profile_table = trimmed_profile_table, 
+                                 model_names = c("svmLinear", "svmRadial"),
+                                 expanded_grid = expanded_grid,
+                                 generate_null = TRUE,
+                                 target_workers = 2,
+                                 null_workers = 1,
+                                 add_nulls = TRUE,
+                                 n_nulls = 1,
+                                 support_level = 3,
+                                 nested_data = nested_data,
+                                 target_annotations = refchem_collapsed,
+                                 seed = 123, 
+                                 exemplar_chems = exemplar_chems,
+                                 save_model = FALSE,
+                                 output_dir = "../output/test_output")
+```
+
+<br>
+
+Iteratively plot results
+
+```{r}
+for (i in 1:length(model_targets_result_null)){
+  temp = model_targets_result_null[[i]][[2]][[1]]$pred
+  
+  temp = temp[temp$label != "exemplar",]
+
+
+mu <- ddply(temp, "label", summarise, grp.mean=mean(target))
+
+print(ggplot(data = temp, aes(x = target, fill = label))+
+          ggtitle(names(model_targets_result_null)[i])+
+  geom_area(stat = "bin", alpha = 0.6, binwidth = 0.1)+
+      xlim(0,1)+
+  theme_classic()+
+  xlab(label = "prediction")+
+  geom_vline(data = mu, aes(xintercept = grp.mean, color = label),linetype = "dashed"))
+}
+```
+
+***
+
+<br>
+
+## Pipelining Functions
+
+For automate classifer training with parallelzation, there is a function that allows for data preprocessing and classifier training all in one. Results are written out to a specified disk location. This is especially useful for running analyses out of scripts on other high performance computing environments, such as the EPA HESC.
+
++ These functions are designed to be executed from the command line or from a new R-session.  All of the data import and preprocessing is done internally.  It should be possible to completely clear the memory of objects generated in previous steps of this analysis and run the code below. 
+
+```{r}
+#load mieml_httrpl functions
+source("../scripts/ML_functions_HTTr.R")
+
+ml_job(refchemdb_path = "../data/refchemdb/NIHMS1537541-supplement-Supplement1.xlsx",
+       expanded_grid_path = "../data/expanded_grid/expanded_grid.rds",
+       metadata_path = c("../data/mongodb_dump/httr_metadata.rds"),
+       support_level = 3,
+       allowParallel_training = TRUE,
+       target_workers = 1,
+       null_workers = 25,
+       n_nulls = 25,
+       min_chemicals = 5, 
+       min_profiles = 200,
+       profile_limit =  20, 
+       model_names = c("svmLinear"), 
+       seed = 123,
+       cutree_h = 0.7,
+       cluster_method = "complete",
+       save_model = TRUE,
+       output_dir = "../data/test_output",
+       gene_expression_data_path = "../data/gene_expression/normalized_gene_expression_data.rds",
+       tpod_estimate_path = "../data/tpod_estimates/tpod_estimates.csv",
+       critical_perm_metrics = c("internal_accuracy", "holdout_accuracy"),
+       critical_perm_thresholds = c(0.1, 0.1))
+                        
+```
+
+Print session info
+```{r}
+sessionInfo()
+```
+
+

@@ -1,0 +1,284 @@
+---
+title: Notebook for cross-referencing MIEML classifier performance against expression of modeled targets in the MCF7 screen
+author: "Joseph Bundy"
+date: "3/14/2025"
+output: 
+  html_notebook:
+    code_folding: none
+    toc: true
+    toc_depth: 1
+    toc_float: false
+    number_sections: false
+---
+
+<br>
+
+## Background
+
+In preparation for publishing on MIEML using HTTr training data, co-authors have pointed out that we should look at how model performance correlates with the underlying expression of these targets.  The initial L1000 based analysis did this looking at relative expression of targets between MCF7 and PC3 using data from the human protein atlas.  
+
+Here, we derive normalized expression values for these targets directly from the DMSO wells across the experiment and then regress classifier performance metrics against those values.
+
+<br>
+
+## Data Import and Preprocessing
+
+<br>
+
+Source MIEML functions
+```{r}
+#load mieml_httrpl functions
+source("../scripts/ML_functions_HTTr.R")
+```
+
+<br>
+
+Import RefChemDB Annotations
+```{r}
+collapsed_refchemdb_targets <- collapse_refchemdb_targets(refchemdb_path = "../data/refchemdb/NIHMS1537541-supplement-Supplement1.xlsx",
+                                                        support_levels = c(3),
+                                                        min_chemicals = 5,
+                                                        cutree_h = 0.7,
+                                                        cluster_method= "complete"
+)
+
+refchem_collapsed <- collapsed_refchemdb_targets$collapsed_targets
+refchem_collapsed <- refchem_collapsed[refchem_collapsed$support >= 3,]
+
+stingy_target_annotations <- data.frame()
+for (i in unique(refchem_collapsed$dsstox_substance_id)){
+  relevant_targets <- refchem_collapsed[refchem_collapsed$dsstox_substance_id == i,]
+  if(nrow(relevant_targets) > 0){
+    relevant_targets <- relevant_targets[order(relevant_targets$support, decreasing = TRUE),]
+    stingy_target_annotations <- rbind(head(relevant_targets, 1), stingy_target_annotations)
+  }
+}
+refchem_collapsed <- stingy_target_annotations
+rm(stingy_target_annotations)
+```
+
+<br>
+
+Tabulate the number of chemicals available for each target_mode with table_targets()
+```{r, message = FALSE, warning = FALSE}
+target_table <- table_targets(refchem_collapsed)
+head(target_table)
+```
+
+<br>
+
+Import and pre-process metadata
+```{r}
+metadata <- readRDS("../data/mongodb_dump/httr_metadata.rds")
+```
+
+<br>
+
+Not all gene expression profiles in this data set will be suitable for training data sets, as some of the profiles will correspond to cocentrations where the chemical is not active. Merge metadata with tpod estimates to identify gene expression profiles corresponding to chemical treaments that are likely bioactive
+
+```{r}
+tpod_estimates <- read.csv("../data/tpod_estimates/tpod_estimates.csv", header = TRUE)
+bioactive_metadata <- merge(metadata, tpod_estimates[c("chem_id", "gene_bpac05")], by = "chem_id")
+bioactive_metadata <- bioactive_metadata[bioactive_metadata$conc > bioactive_metadata$gene_bpac05,]
+```
+
+<br>
+
+Import and preprocess httrpl processed gene expression profiles
+
+profile_size is an upper limit to the number of gene expression profiles that can be included in training data for any one chemical.  If a chemical has more than profile_limit profiles, profiles will be dropped randomly so that there are profile_limit profiles per chemical.
+
+```{r, message = FALSE}
+nested_data <- get_gene_expression_data(metadata = bioactive_metadata,
+                                 seed = 123,
+                                 gene_expression_data_path = "../data/gene_expression/normalized_gene_expression_data.rds",
+                                profile_limit = 20)
+```
+
+Tabulate gene expression profiles available for training MIE-specific models
+
+<br>
+
+Tabulate the number of available gene expression profiles for each target_mode, specifying minimum cutoffs for the number of chemicals and/or profiles required for the target_mode to be a viable target for prediction
+```{r, message = FALSE}
+profile_table <- table_profiles(target_table = target_table, 
+                                 metadata =  nested_data$metadata, 
+                                 target_annotations = refchem_collapsed,
+                                 min_profiles = 25, 
+                                 min_chemicals = 5)
+profile_table
+```
+
+<br>
+
+create a list to catch target group and probe information for each listed target
+```{r}
+target_group_list <- list()
+
+for (i in 1:nrow(profile_table)){
+  temp_group_info <- collapsed_refchemdb_targets$groups[collapsed_refchemdb_targets$groups$group == profile_table[i,]$target_mode,]
+  target_group_list[[i]] <-  list("groupings" = data.frame(temp_group_info))
+}
+
+names(target_group_list) <- profile_table$target_mode
+```
+
+import httr_probe collection for this data set
+```{r}
+httr_probe <- readRDS("../data/mongodb_dump/httr_probe.rds")
+head(httr_probe)
+```
+<br>
+
+Iterate through each target in the target_group_list and print the child targets that were combined into each group - then use those gene names to manually select the appropriate probes to use to estimate each target's relative expression
+```{r}
+for (i in 1:length(target_group_list)){
+  print(target_group_list[[i]]$groupings)
+}
+```
+<br>
+
+Iterate through each target and grab the probes associated with gene symbols subsumed by that target group
+
+Start with ESR agonsim, which combines ESR1 and ESR2 agonists
+```{r}
+for (i in 1:length(target_group_list)){
+  relevant_targets <- gsub(x = target_group_list[[i]]$groupings$name, pattern = "_Positive", replacement = "")
+  relevant_targets <- gsub(x = relevant_targets, pattern = "_Negative", replacement = "")
+  target_group_list[[i]]$relevant_probes <- httr_probe[httr_probe$gene_symbol %in% relevant_targets,]
+  
+  message("Found ", nrow(target_group_list[[i]]$relevant_probes), " probes for ", names(target_group_list[i]))
+  
+}
+
+```
+
+<br>
+
+Now that the relevant probes are identified, pull down counts from DMSO wells across the entire experiment
+```{r}
+#create metadata object coresponding to only DMSO wells
+DMSO_metadata <- metadata[metadata$qc_flag == "OK" & metadata$stype == "vehicle control",]
+
+#pull in raw count data for whole experiment
+raw_counts <- readRDS("../data/mongodb_dump/httr_counts.rds")
+
+#subset count matrix to only vehicle control samples
+DMSO_counts <- raw_counts[DMSO_metadata$sample_id]
+```
+
+<br>
+
+de-attenuate counts by multiplying relevant probe counts by attenuation factors
+```{r}
+probes_to_deattenuate <- httr_probe[httr_probe$attenuation > 1,]
+
+deattenuated_DMSO_counts <- DMSO_counts
+
+for (i in 1:nrow(probes_to_deattenuate)){
+  temp_probe_name <- probes_to_deattenuate[i,]$probe_name
+if (temp_probe_name %in% row.names(deattenuated_DMSO_counts)){
+  deattenuated_DMSO_counts[row.names(deattenuated_DMSO_counts) == temp_probe_name,] <- deattenuated_DMSO_counts[row.names(deattenuated_DMSO_counts) == temp_probe_name,] * httr_probe[httr_probe$probe_name == temp_probe_name,]$attenuation
+}
+  }
+```
+
+<br>
+
+Convert count data to CPM
+```{r}
+DMSO_CPM <- data.frame(t(t(deattenuated_DMSO_counts)/DMSO_metadata$n_reads_mapd))*1000000
+DMSO_CPM <- DMSO_CPM + 1
+```
+
+<br>
+
+calculate mean CPM across all these samples
+```{r}
+mean_DMSO_CPM <- data.frame(means = apply(DMSO_CPM, 1, function(x) mean(x)))
+```
+
+<br>
+
+Step through each target in the target list and take the max CPM value across targets subsummed by each MIE
+```{r}
+for (i in 1:length(target_group_list)){
+  relevant_probes <- target_group_list[[i]]$relevant_probes$probe_name
+  
+  target_group_list[[i]]$max_CPM <- max(mean_DMSO_CPM[row.names(mean_DMSO_CPM) %in% relevant_probes,])
+  target_group_list[[i]]$median_CPM <- median(mean_DMSO_CPM[row.names(mean_DMSO_CPM) %in% relevant_probes,])
+  target_group_list[[i]]$mean_CPM <- mean(mean_DMSO_CPM[row.names(mean_DMSO_CPM) %in% relevant_probes,])
+  
+  #create a pretty MIE name as well
+  target_group_list[[i]]$pretty_MIE_name <- make_annotations_pretty(names(target_group_list[i]))
+}
+```
+
+<br>
+
+Import classifier performance results
+```{r}
+results <- read.csv("../data/classifier_performance_summary.csv", header = TRUE)
+```
+
+<br>
+
+Identify targets that trained classifiers that passed empirical significance testing
+```{r}
+passing_targets <- unique(results[results$int_acc_emp_pval <= 0.1 & results$hold_acc_emp_pval <= 0.1 ,]$target_name)
+passing_targets <- make_annotations_pretty(passing_targets)
+```
+
+<br>
+
+Combine accuracy and baseline expression data into single object
+```{r}
+plot_df <- data.frame()
+
+for (i in 1:length(target_group_list)){
+  plot_df <- rbind(data.frame("MIE_Name" = target_group_list[[i]]$pretty_MIE_name,
+                              "mean_internal_accuracy" = mean(results[results$target_name == names(target_group_list[i]),]$internal_accuracy),
+                              "log10_max_CPM" = log10(target_group_list[[i]]$max_CPM), 
+                              "log10_median_CPM" = log10(target_group_list[[i]]$median_CPM),
+                              "log10_mean_CPM" = log10(target_group_list[[i]]$mean_CPM)),
+                   plot_df)
+}
+
+plot_df$passed_sig_testing <- "No"
+plot_df[plot_df$MIE_Name %in% passing_targets,]$passed_sig_testing <- "Yes"
+```
+
+<br>
+
+Generate plot regressing internal accuracy against baseline expression
+
+```{r, fig.width= 8, fig.height=5}
+library(ggplot2)
+library(ggrepel)
+scatter_plot <- ggplot(data = plot_df, aes(x= log10_max_CPM, y=mean_internal_accuracy, color = passed_sig_testing)) + 
+  geom_point() +
+  xlab("Log10 CPM Baseline Expression") +
+  ylab("Mean Internal Accuracy Across Classifiers") +
+  scale_color_manual(values = c("black", "red")) +
+  geom_text_repel(aes(label = MIE_Name), size = 2.5) +
+  theme_minimal() +
+  guides(color=guide_legend(title="Passed E.S.T."))
+
+scatter_plot
+```
+
+<br>
+
+Save file to disk
+```{r}
+tiff(filename = "../figures/classifer_performance_by_CPM.tiff", height = 5, width = 8, units = "in", res = 300)
+scatter_plot
+dev.off()
+```
+
+<br>
+
+Print session info
+```{r}
+sessionInfo()
+```

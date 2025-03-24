@@ -1,0 +1,140 @@
+---
+title: R Notebook for preprocessing gene expression data processed with EPA httrpl pipeline for use in mieml
+author: "Joseph Bundy"
+date: "3/5/2025"
+output: 
+  html_notebook:
+    code_folding: none
+    toc: true
+    toc_depth: 1
+    toc_float: false
+    number_sections: false
+---
+
+<br>
+
+## Define libraries and analysis configuration
+
+<br>
+
+### Source mieml_httrpl functions from R scripts and import relevant libraries
+```{r}
+options(stringsAsFactors = FALSE)
+
+#import mieml functions
+source("../scripts/ML_functions_HTTr.R")
+```
+
+<br>
+
+## Import data
+
+### load sample metadata
+```{r}
+all_well_info <- readRDS("../data/mongodb_dump/httr_metadata.rds")
+```
+
+### load count data
+```{r}
+count_data <- readRDS("../data/mongodb_dump/httr_counts.rds")
+```
+
+### load probe metadata
+```{r}
+probe_info <- readRDS("../data/mongodb_dump/httr_probe.rds")
+```
+
+### count the number of test samples with at least 5 counts
+```{r}
+test_sample_metadata <- all_well_info[all_well_info$stype == "test sample",]
+test_sample_count_data <- count_data[c(test_sample_metadata$sample_id)]
+
+gt4_counter <- data.frame(rowSums(test_sample_count_data >= 5))
+names(gt4_counter) <- "npass"
+gt4_counter$probe_id <- row.names(gt4_counter)
+```
+
+### Determine count level cutoff
+
+How many genes would be retained if discard genes that have fewer than 5 counts in 25% of samples?
+```{r}
+#total number of test wells in this study
+well_num <- ncol(test_sample_count_data)
+
+nrow(gt4_counter[gt4_counter$npass > (well_num * 0.95),])
+
+nrow(gt4_counter[gt4_counter$npass > (well_num * 0.90),])
+
+nrow(gt4_counter[gt4_counter$npass > (well_num * 0.75),])
+
+nrow(gt4_counter[gt4_counter$npass > (well_num * 0.50),])
+```
+
+### Filter out low abundance probes and convert counts to CPM + 1
+
+```{r}
+#remove low abundance probes
+filtered_probe_ids <- gt4_counter[gt4_counter$npass > (well_num * 0.75),]$probe_id
+count_data <- count_data[row.names(count_data) %in% filtered_probe_ids,]
+
+#ensure count data and well info are in same order
+count_data <- count_data[c(all_well_info$sample_id)]
+
+#divide count data by reads in millions, transforming it to CPM
+log2cpm_data <- data.frame(t(t(count_data)/all_well_info$n_reads_mapd))*1000000
+
+#transform further by adding 1 to CPM and then transforming with log2()
+log2cpm_data <- log2(log2cpm_data + 1)
+```
+
+### Normalize gene expression data to vehicle controls
+
+calculate the study wide means and SDs from DMSO wells
+```{r}
+#filter well info to only the vehicle controls
+vehicle_control_metadata <- all_well_info[all_well_info$stype == "vehicle control",]
+
+#calculate probe-wise mean
+zscore_adjustments <- data.frame("means" = apply(log2cpm_data[vehicle_control_metadata$sample_id], 1, function(x) mean(x)))
+  
+#calculate probe-wise SD
+zscore_adjustments$SDs <-  apply(log2cpm_data[vehicle_control_metadata$sample_id], 1, function(x) sd(x))
+
+normalized_data = log2cpm_data-zscore_adjustments$means
+normalized_data = normalized_data/zscore_adjustments$SDs
+```
+
+
+### Save normalized data to disk
+
+```{r}
+if (!file.exists("../data/gene_expression")){
+  dir.create("../data/gene_expression")
+} 
+saveRDS(normalized_data, file = "../data/gene_expression/normalized_gene_expression_data.rds")
+```
+
+### Preprocess gene level concentration response data into sample level summaries
+
+```{r}
+#use calculate tpods to estimate chemical level tpods from gene level concentration response data
+chemical_tpods <- calculate_tpods("../data/gene_cr_data/GENE_CR_mcf7_ph1_pe1_normal_block_123_allPG_0.05_conthits.RData")
+
+#filter down to only the chem_ids present in well information 
+chemical_tpods <- chemical_tpods[chemical_tpods$chem_id %in% all_well_info$chem_id,]
+
+#write chemical tpods to disk
+if (!file.exists("../data/tpod_estimates")){
+  dir.create("../data/tpod_estimates")
+} 
+
+write.csv(chemical_tpods, "../data/tpod_estimates/tpod_estimates.csv")
+```
+
+
+
+Print session info
+```{r}
+sessionInfo()
+```
+

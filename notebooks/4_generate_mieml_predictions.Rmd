@@ -1,0 +1,89 @@
+---
+title: "Generate Molecular Initiating Event Predictions for Selected MIEML Classifiers"
+author: "Joseph Bundy"
+date: "3/11/2025"
+output: 
+  html_notebook:
+    code_folding: none
+    toc: true
+    toc_depth: 1
+    toc_float: false
+    number_sections: false
+---
+
+<br>
+
+This notebook uses MIEML functions to generate MIE predictions from high performance classifiers
+
+## Data Import
+
+<br>
+
+Define constants to be used throughout notebook 
+```{r}
+REFCHEMDB_PATH = "../data/refchemdb/NIHMS1537541-supplement-Supplement1.xlsx"
+GENE_EXPRESSION_DATA_PATH = "../data/gene_expression/normalized_gene_expression_data.rds"
+METADATA_PATH = "../data/mongodb_dump/httr_metadata.rds"
+```
+ 
+<br>
+ 
+Import classifier performance summary and exemplar chemical table
+```{r}
+classifier_performance_summary <- read.csv(file = "../data/classifier_performance_summary.csv", header = TRUE)
+exemplar_chems <- read.csv(file = "../data/exemplar_chems.csv", header = TRUE)
+```
+
+<br>
+
+Re-derive exemplar reference chemical annotations
+```{r}
+#load mieml_httrpl functions
+source("../scripts/ML_functions_HTTr.R")
+collapsed_refchemdb_targets <- collapse_refchemdb_targets(refchemdb_path = REFCHEMDB_PATH,
+                                                        support_levels = c(3),
+                                                        min_chemicals = 5,
+                                                        cutree_h = 0.7,
+                                                        cluster_method= "complete")
+
+refchem_collapsed <- collapsed_refchemdb_targets$collapsed_targets
+refchem_collapsed <- refchem_collapsed[refchem_collapsed$support >= 3,]
+
+#filter refchemdb targets such that each chemical is linked to only one target
+stingy_target_annotations <- data.frame()
+for (i in unique(refchem_collapsed$dsstox_substance_id)){
+        relevant_targets <- refchem_collapsed[refchem_collapsed$dsstox_substance_id == i,]
+        if(nrow(relevant_targets) > 0){
+                relevant_targets <- relevant_targets[order(relevant_targets$support, decreasing = TRUE),]
+                stingy_target_annotations <- rbind(head(relevant_targets, 1), stingy_target_annotations)
+        }
+}
+refchem_collapsed <- stingy_target_annotations
+rm(stingy_target_annotations)
+```
+ 
+
+## Generate MIE predictions
+
+Use MIEML function to generate MIE predictions for classifiers that passed empirical significance analysis
+```{r, warning= FALSE}
+#subset the table of classifier performance metrics to only those that passed empirical significance analysis
+high_performance_classifiers <- classifier_performance_summary[classifier_performance_summary$int_acc_emp_pval <= 0.1 & classifier_performance_summary$hold_acc_emp_pval <= 0.1,]
+
+#generate MIE predictions
+MIE_predictions <- generate_MIE_predictions(high_performance_models = high_performance_classifiers,
+                                            exemplar_chems = exemplar_chems,
+                                            metadata_path = METADATA_PATH,
+                                            gene_expression_data_path = GENE_EXPRESSION_DATA_PATH,
+                                            target_annotations = refchem_collapsed)
+
+#save results
+saveRDS(MIE_predictions, file = "../data/MIEML_predictions.rds")
+```
+
+Print session info
+```{r}
+sessionInfo()
+```
+
+
