@@ -93,4 +93,4 @@ git clone https://github.com/USEPA/CompTox-MIEML_HTTr.git (/path/to/analysis)
 ## Contributors
 
 + **[Logan J. Everett](mailto:everett.logan@epa.gov)**
-+ **[Joseph L. Bundy](mailto:bundy.joseph@epa.gov)**
++ **[Joseph L. Bundy](mailto:josephlbundy@gmail.com)**
